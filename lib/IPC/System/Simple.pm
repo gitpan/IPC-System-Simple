@@ -12,10 +12,15 @@ use constant VMS     => ($^O eq 'VMS');
 use if WINDOWS, 'Win32::Process', qw(INFINITE NORMAL_PRIORITY_CLASS);
 use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
 
+# On Perl's older than 5.8.x we can't assume that there'll be a
+# $^{TAINT} for us to check, so we assume that our args may always
+# be tainted.
+use constant ASSUME_TAINTED => ($] < 5.008);
+
 require Exporter;
 our @ISA = qw(Exporter);
-our @EXPORT_OK = qw( run capture $EXITVAL );
-our $VERSION = '0.07';
+our @EXPORT_OK = qw( run $EXITVAL );
+our $VERSION = '0.08';
 our $EXITVAL = -1;
 
 my @Signal_from_number = split(' ', $Config{sig_name});
@@ -51,7 +56,8 @@ if ($@ =~ /not (?:defined|a valid) POSIX macro/) {
 sub run {
 
 	# Complain on tainted arguments or environment.
-	if (${^TAINT}) {
+	# ASSUMED_TAINTED is true for 5.6.x, since it's missing ${^TAINT}
+	if (ASSUME_TAINTED or ${^TAINT}) {
 		foreach my $var (@_) {
 			if (tainted $var) {
 				croak qq{IPC::System::Simple::run called with tainted argument '$var'};
@@ -204,10 +210,10 @@ Perl's built-in C<system>:
 	run("cat","/etc/motd");		# Execute command without shell
 
 In the case where the command returns an unexpected status,
-C<run> will throw an exception, which is not caught will terminate
+C<run> will throw an exception, which if not caught will terminate
 your program with an error.
 
-Capturing an the exception is easy:
+Capturing the exception is easy:
 
 	eval {
 		run("cat *.txt");
@@ -307,7 +313,7 @@ start (as determined from C<$!>) will be provided.
 
 =item "%s" unexpectedly returned exit value %d
 
-The command ran successful, but returned an exit value we did
+The command ran successfully, but returned an exit value we did
 not expect.  The value returned is reported.
 
 =item "%s" died to signal "%s" (%d)
@@ -319,7 +325,7 @@ signal number is always reported.
 =item Internal error in IPC::System::Simple - "%s" ran without exit value or signal
 
 You've found a bug in C<IPC::System::Simple>.  It knows your command
-ran successful, but doesn't know how or why it stopped.  Please
+ran successfully, but doesn't know how or why it stopped.  Please
 report this error using the submission mechanism described in
 BUGS below.
 
