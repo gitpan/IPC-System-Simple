@@ -1,22 +1,21 @@
+#!/usr/bin/perl -w
+use strict;
 use 5.006;
 use constant WINDOWS => ($^O eq 'MSWin32');
-use ExtUtils::MakeMaker;
-# See lib/ExtUtils/MakeMaker.pm for details of how to influence
-# the contents of the Makefile that is written.
-WriteMakefile(
-    NAME              => 'IPC::System::Simple',
-    VERSION_FROM      => 'lib/IPC/System/Simple.pm', # finds $VERSION
-    PREREQ_PM         => {
-	'Config'      => 0,
-	'List::Util'  => 0,
-	'Scalar::Util'=> 0,
-	(WINDOWS ? ( 'Win32::Process' => 0 ) : ())
-    },
-    ($ExtUtils::MakeMaker::VERSION > 6.30 ?
-      ( LICENSE           => 'perl' ) : ()
-    ),
-    ($] >= 5.005 ?     ## Add these new keywords supported since 5.005
-      (ABSTRACT_FROM  => 'lib/IPC/System/Simple.pm', # retrieve abstract from module
-       AUTHOR         => 'Paul Fenwick <pjf@cpan.org>') : ()
-    ),
-);
+use inc::Module::Install;
+
+name		'IPC-System-Simple';
+all_from	'lib/IPC/System/Simple.pm';
+
+requires	'Config'	=> 0;
+requires	'List::Util'	=> 0;
+requires	'Scalar::Util'	=> 0;
+requires	'Win32::Process'=> 0 if WINDOWS;
+requires	'File::Spec'	=> 0 if WINDOWS;
+
+test_requires	'Test'		=> 0;
+test_requires	'Test::More'	=> 0;
+test_requires	'File::Basename'=> 0;
+
+WriteAll;
+

@@ -3,6 +3,8 @@ use strict;
 use Test::More;
 use Config;
 
+use constant SIGKILL => 9;
+
 if ($^O eq "MSWin32") {
 	plan skip_all => "Signals not implemented on Win32";
 } else {
@@ -26,7 +28,7 @@ run([1],$perl_path,"signaler.pl",0);
 ok(1);
 
 eval {
-	run([1],$perl_path,"signaler.pl",9);	# SIGKILL on most systems.
+	run([1],$perl_path,"signaler.pl",SIGKILL);
 };
 
 like($@, qr/died to signal/);

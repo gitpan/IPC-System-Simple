@@ -3,6 +3,7 @@ package IPC::System::Simple;
 use 5.006;
 use strict;
 use warnings;
+use re 'taint';
 use Carp;
 use List::Util qw(first);
 use Scalar::Util qw(tainted);
@@ -10,17 +11,40 @@ use Config;
 use constant WINDOWS => ($^O eq 'MSWin32');
 use constant VMS     => ($^O eq 'VMS');
 use if WINDOWS, 'Win32::Process', qw(INFINITE NORMAL_PRIORITY_CLASS);
+use if WINDOWS, 'File::Spec';
+
+# Note that we don't use WIFSTOPPED because perl never uses
+# the WUNTRACED flag, and hence will never return early from
+# system() if the child processes is suspended with a SIGSTOP.
+
 use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
+
+use constant FAIL_START     => q{"%s" failed to start: "%s"};
+use constant FAIL_PLUMBING  => q{Error in IPC::System::Simple plumbing: "%s" - "%s"};
+use constant FAIL_CMD_BLANK => q{Entirely blank command passed: "%s"};
+use constant FAIL_INTERNAL  => q{Internal error in IPC::System::Simple: "%s"};
+use constant FAIL_TAINT     => q{IPC::System::Simple::%s called with tainted argument "%s"};
+use constant FAIL_TAINT_ENV => q{IPC::System::Simple::%s called with tainted environment $ENV{%s}};
+use constant FAIL_SIGNAL    => q{"%s" died to signal "%s" (%d)%s};
+use constant FAIL_BADEXIT   => q{"%s" unexpectedly returned exit value %d};
+
+
+use constant FAIL_POSIX     => q{IPC::System::Simple does not understand the POSIX error '%s'.  Please check http://search.cpan.org/perldoc?IPC::System::Simple to see if there is an updated version.  If not please report this as a bug to http://rt.cpan.org/Public/Bug/Report.html?Queue=IPC-System-Simple};
 
 # On Perl's older than 5.8.x we can't assume that there'll be a
 # $^{TAINT} for us to check, so we assume that our args may always
 # be tainted.
 use constant ASSUME_TAINTED => ($] < 5.008);
 
+use constant EXIT_ANY_CONST => -1;			# Used internally
+use constant EXIT_ANY       => [ EXIT_ANY_CONST ];	# Exported
+
+use constant UNDEFINED_POSIX_RE => qr{not (?:defined|a valid) POSIX macro};
+
 require Exporter;
 our @ISA = qw(Exporter);
-our @EXPORT_OK = qw( run $EXITVAL );
-our $VERSION = '0.08';
+our @EXPORT_OK = qw( capture run $EXITVAL EXIT_ANY );
+our $VERSION = '0.09';
 our $EXITVAL = -1;
 
 my @Signal_from_number = split(' ', $Config{sig_name});
@@ -41,34 +65,35 @@ if (VMS) {
 
 eval { WIFEXITED(0); };
 
-if ($@ =~ /not (?:defined|a valid) POSIX macro/) {
+if ($@ =~ UNDEFINED_POSIX_RE) {
 	*WIFEXITED   = sub { not $_[0] & 0xff };
 	*WEXITSTATUS = sub { $_[0] >> 8  };
 	*WIFSIGNALED = sub { $_[0] & 127 };
 	*WTERMSIG    = sub { $_[0] & 127 };
 } elsif ($@) {
-	croak "IPC::System::Simple does not understand the POSIX error '$@'.  Please check http://search.cpan.org/perldoc?IPC::System::Simple to see if there is an updated version.  If not please report this as a bug to http://rt.cpan.org/Public/Bug/Report.html?Queue=IPC-System-Simple";
+	croak sprintf FAIL_POSIX, $@;
 }
 
-# TODO - This doesn't look for core-dumps yet.
-# TODO - WTF is a WIFSTOPPED and how can it hurt us?
+# None of the POSIX modules I've found define WCOREDUMP, although
+# many systems define it.  Check the POSIX module on the hope that
+# it may actually be there.
+
+eval { POSIX::WCOREDUMP(1); };
+
+if ($@ =~ UNDEFINED_POSIX_RE) {
+	*WCOREDUMP = sub { $_[0] & 128 };
+} elsif ($@) {
+	croak sprintf FAIL_POSIX, $@;
+} else {
+	# POSIX actually has it defined!  Huzzah!
+	*WCOREDUMP = \&POSIX::WCOREDUMP;
+}
+
+# run is our way of running a process with system() semantics
 
 sub run {
 
-	# Complain on tainted arguments or environment.
-	# ASSUMED_TAINTED is true for 5.6.x, since it's missing ${^TAINT}
-	if (ASSUME_TAINTED or ${^TAINT}) {
-		foreach my $var (@_) {
-			if (tainted $var) {
-				croak qq{IPC::System::Simple::run called with tainted argument '$var'};
-			}
-		}
-		foreach my $var (@Check_tainted_env) {
-			if (tainted $ENV{$var} ) {
-				croak qq{IPC::System::Simple::run called with tainted environment \$ENV{$var}};
-			}
-		}
-	}
+	_check_taint(@_);
 
 	my ($valid_returns, $command, @args) = _process_args(@_);
 
@@ -80,16 +105,9 @@ sub run {
 
 	if (WINDOWS and @args) {
 		our $EXITVAL = -1;
-		my $pid;
-		my $success = Win32::Process::Create(
-			$pid,$command,"$command @args",1,NORMAL_PRIORITY_CLASS,"."
-		);
-		if (not $success) {
-			croak sprintf(
-				q{"%s" failed to start: "%s"},
-				$command, $^E
-			);
-		}
+
+		my $pid = _spawn_or_die($command, "$command @args");
+
 		$pid->Wait(INFINITE);	# Wait for process exit.
 		$pid->GetExitCode($EXITVAL);
 		return _check_exit($command,$EXITVAL,$valid_returns);
@@ -100,10 +118,203 @@ sub run {
 
 	# We're throwing our own exception on command not found, so
 	# we don't need a warning from Perl.
-	no warnings 'exec';
+	no warnings 'exec';		## no critic
 	system($command,@args);
 
 	return _process_child_error($?,$command,$valid_returns);
+}
+
+# capture is our way of running a process with backticks/qx semantics
+
+sub capture {
+	_check_taint(@_);
+
+	my ($valid_returns, $command, @args) = _process_args(@_);
+
+	our $EXITVAL = -1;
+
+	my $wantarray = wantarray();
+
+	if (WINDOWS) {
+		# Perl doesn't support multi-arg backticks under
+		# Windows.  Perl also doesn't provide very good
+		# feedback when normal backtails fail, either,
+		# instead returning the exit status from the shell
+		# (which is indistinguishable from the command
+		# running and producing the same exit status).
+
+		# As such, we essentially have to write our own
+		# backticks.
+
+		# We start by dup'ing STDOUT.
+
+		open(my $saved_stdout, '>&', \*STDOUT)  ## no critic
+			or croak sprintf(FAIL_PLUMBING, "Can't dup STDOUT", $!);
+
+		# We now open up a pipe that will allow us to	
+		# communicate with the new process.
+
+		pipe(my ($read_fh, $write_fh))
+			or croak sprintf(FAIL_PLUMBING, "Can't create pipe", $!);
+
+		# Allow CRLF sequences to become "\n", since
+		# this is what Perl backticks do.
+
+		binmode($read_fh, ':crlf');
+
+		# Now we re-open our STDOUT to $write_fh...
+
+		open(STDOUT, '>&', $write_fh)  ## no critic
+			or croak sprintf(FAIL_PLUMBING, "Can't redirect STDOUT", $!);
+
+		# And now we spawn our new process with inherited
+		# filehandles.
+
+		my $exe = @args                      ? $command :
+			  $command =~ m{^"([^"]+)"}x ? $1       :
+			  $command =~ m{(\S+)     }x ? $1       :
+			  croak sprintf(FAIL_CMD_BLANK, $command);
+
+		my $pid = _spawn_or_die($exe, "$command @args");
+
+		# Now restore our STDOUT.
+		open(STDOUT, '>&', $saved_stdout)  ## no critic
+			or croak sprintf(FAIL_PLUMBING,"Can't restore STDOUT", $!);
+
+		# Clean-up the filehandles we no longer need...
+
+		close($write_fh)
+			or croak sprintf(FAIL_PLUMBING,q{Can't close write end of pipe}, $!);
+		close($saved_stdout)
+			or croak sprintf(FAIL_PLUMBING,q{Can't close saved STDOUT}, $!);
+
+		# Read the data from our child...
+
+		my (@results, $result);
+
+		if ($wantarray) {
+			@results = <$read_fh>;
+		} else {
+			$result = join("",<$read_fh>);
+		}
+
+		# Tidy up our windows process and we're done!
+
+		$pid->Wait(INFINITE);	# Wait for process exit.
+		$pid->GetExitCode($EXITVAL);
+
+		_check_exit($command,$EXITVAL,$valid_returns);
+
+		return $wantarray ? @results : $result;
+	}
+
+	# We'll produce our own warnings on failure to execute.
+	no warnings 'exec';	## no critic
+
+	if (not @args) {
+		if ($wantarray) {
+			my @results = qx($command);
+			_process_child_error($?,$command,$valid_returns);
+			return @results;
+		} 
+
+		my $results = qx($command);
+		_process_child_error($?,$command,$valid_returns);
+		return $results;
+	}
+
+	# If we're here, we have arguments.  Avoid the shell using
+	# multi-arg open.
+
+	# NB: We don't check the return status on close(), since
+	# on failure it sets $?, which we then inspect for more
+	# useful information.
+
+	open(my $pipe, "-|", $command, @args)
+		or croak sprintf(FAIL_START, $command, $!);
+
+	if ($wantarray) {
+		my @results = <$pipe>;
+		close($pipe);
+		_process_child_error($?,$command,$valid_returns);
+		return @results;
+	}
+
+	my $results = join("",<$pipe>);
+	close($pipe);
+	_process_child_error($?,$command,$valid_returns);
+	
+	return $results;
+
+}
+
+# Tries really hard to spawn a process under Windows.  Returns
+# the pid on success, or undef on error.
+
+sub _spawn_or_die {
+
+	# We need to wrap practically the entire sub in an
+	# if block to ensure it doesn't get compiled under non-Win32
+	# systems.  Compiling on this systems would not only be a
+	# waste of time, but also results in complaints about
+	# the NORMAL_PRIORITY_CLASS constant.
+
+	if (not WINDOWS) {
+		croak sprintf(FAIL_INTERNAL, "_spawn_or_die called when not under Win32");
+	} else {
+		my ($orig_exe, $cmdline) = @_;
+		my $pid;
+
+		my $exe = $orig_exe;
+
+		# If our command doesn't have an extension, add one.
+		$exe .= $Config{_exe} if ($exe !~ m{\.});
+
+		Win32::Process::Create(
+			$pid, $exe, $cmdline, 1, NORMAL_PRIORITY_CLASS, "."
+		) and return $pid;
+
+		my @path = split(/;/,$ENV{PATH});
+
+		foreach my $dir (@path) {
+			my $fullpath = File::Spec->catfile($dir,$exe);
+
+			# We're using -x here on the assumption that stat()
+			# is faster than spawn, so trying to spawn a process
+			# for each path element will be unacceptably
+			# inefficient.
+
+			if (-x $fullpath) {
+				Win32::Process::Create(
+					$pid, $fullpath, $cmdline, 1,
+					NORMAL_PRIORITY_CLASS, "."
+				) and return $pid;
+			}
+		}
+
+		croak sprintf(FAIL_START, $orig_exe, $^E);
+	}
+}
+
+# Complain on tainted arguments or environment.
+# ASSUME_TAINTED is true for 5.6.x, since it's missing ${^TAINT}
+
+sub _check_taint {
+	return if not (ASSUME_TAINTED or ${^TAINT});
+	my $caller = (caller(1))[3];
+	foreach my $var (@_) {
+		if (tainted $var) {
+			croak sprintf(FAIL_TAINT, $caller, $var);
+		}
+	}
+	foreach my $var (@Check_tainted_env) {
+		if (tainted $ENV{$var} ) {
+			croak sprintf(FAIL_TAINT_ENV, $caller, $var);
+		}
+	}
+
+	return;
+
 }
 
 # This subroutine performs the difficult task of interpreting
@@ -116,8 +327,10 @@ sub _process_child_error {
 	
 	$EXITVAL = -1;
 
+	my $coredump = WCOREDUMP($child_error);
+
 	if ($child_error == -1) {
-		croak qq{"$command" failed to start: "$!"};
+		croak sprintf(FAIL_START, $command, $!);
 
 	} elsif ( WIFEXITED( $child_error ) ) {
 		$EXITVAL = WEXITSTATUS( $child_error );
@@ -128,11 +341,12 @@ sub _process_child_error {
 		my $signal_no   = WTERMSIG( $child_error );
 		my $signal_name = $Signal_from_number[$signal_no] || "UNKNOWN";
 
-		croak qq{"$command" died to signal "$signal_name" ($signal_no)};
+		croak sprintf FAIL_SIGNAL, $command, $signal_name, $signal_no, ($coredump ? " and dumped core" : "");
+
 
 	} 
 
-	croak qq{Internal error in IPC::System::Simple - "$command" ran without exit value or signal};
+	croak sprintf(FAIL_INTERNAL, qq{'$command' ran without exit value or signal});
 
 }
 
@@ -141,9 +355,16 @@ sub _process_child_error {
 # for new features in I::S::S.
 
 sub _check_exit {
-	my ($command,$exitval, $valid_returns) = @_;
+	my ($command, $exitval, $valid_returns) = @_;
+
+	# If we have a single-value list consisting of the EXIT_ANY
+	# value, then we're happy with whatever exit value we're given.
+	if (@$valid_returns == 1 and $valid_returns->[0] == EXIT_ANY_CONST) {
+		return $exitval;
+	}
+
 	if (not defined first { $_ == $exitval } @$valid_returns) {
-		croak qq{"$command" unexpectedly returned exit value $exitval};
+		croak sprintf FAIL_BADEXIT, $command, $exitval;
 	}	
 	return $exitval;
 }
@@ -184,34 +405,80 @@ IPC::System::Simple - Call system() commands with a minimum of fuss
 
 =head1 SYNOPSIS
 
-  use IPC::System::Simple qw(run $EXITVAL);
+  use IPC::System::Simple qw(capture run $EXITVAL EXIT_ANY);
 
-  run("some_command");        # Run a command and check exit status
+  # Run a command, throwing exception on failure
+
+  run("some_command");
 
   run("some_command",@args);  # Run a command, avoiding the shell
 
+  # Run a command which must return 0..5, avoid the shell, and get the
+  # exit value (we could also look at $EXITVAL)
+
   my $exit_value = run([0..5], "some_command", @args);
 
+  # The same, but any exit value will do.
+
+  my $exit_value = run(EXIT_ANY, "some_command", @args);
+
+  # Capture output into $result and throw exception on failure
+
+  my $result = capture("some_command");	
+
+  # Check exit value from captured command
+
   print "some_command exited with status $EXITVAL\n";
+
+  # Captures into @lines, splitting on $/
+  my @lines = capture("some_command"); 
+
+  # Run a command which must return 0..5, capture the output into
+  # @lines, and avoid the shell.
+
+  my @lines  = capture([0..5], "some_command", @args);
 
 =head1 DESCRIPTION
 
 Calling Perl's in-built C<system()> function is easy, but checking
 the results can be hard.  C<IPC::System::Simple> aims to make
-life easy for the I<common cases> of calling system.
+life easy for the I<common cases> of calling C<system> and
+backticks (aka C<qx()>).
 
-C<IPC::System::Simple> provides a single subroutine, called
+=head2 run
+
+C<IPC::System::Simple> provides a subroutine called
 C<run>, that executes a command using the same semantics is
 Perl's built-in C<system>:
 
 	use IPC::System::Simple qw(run);
 
-	run("cat *.txt");		# Execute command via the shell
-	run("cat","/etc/motd");		# Execute command without shell
+	run("cat *.txt");	# Execute command via the shell
+	run("cat","/etc/motd");	# Execute command without shell
 
-In the case where the command returns an unexpected status,
-C<run> will throw an exception, which if not caught will terminate
-your program with an error.
+=head2 capture
+
+A second subroutine, named C<capture> executes a command with
+the same semantics as Perl's built-in backticks (and C<qx()>):
+
+	use IPC::System::Simple qw(capture);
+
+	# Capture text while invoking the shell.
+	my $file  = capture("cat /etc/motd");
+	my @lines = capture("cat /etc/passwd");
+
+However unlike regular backticks, which always use the shell, C<capture>
+will bypass the shell when called with multiple arguments:
+
+	# Capture text while avoiding the shell.
+	my $file  = capture("cat", "/etc/motd");
+	my @lines = capture("cat", "/etc/passwd");
+
+=head2 Exception handling
+
+In the case where the command returns an unexpected status, both C<run> and
+C<capture> will throw an exception, which if not caught will terminate your
+program with an error.
 
 Capturing the exception is easy:
 
@@ -224,6 +491,8 @@ Capturing the exception is easy:
 	}
 
 See the diagnostics section below for more details.
+
+=head3 Exception cases
 
 C<IPC::System::Simple> considers the following to be unexpected,
 and worthy of exception:
@@ -242,14 +511,28 @@ Returning an exit value other than zero (but see below).
 
 Being killed by a signal.
 
+=item *
+
+Being passed tainted data (in taint mode).
+
 =back
 
-You may specify a range of values which are considered acceptable
-return values by passing an I<array reference> as the first argument:
+=head2 Exit values
 
-	run( [0..5], "cat *.txt");	# Exit values 0-5 are OK
+Traditionally, system commands return a zero status for success and a
+non-zero status for failure.  C<IPC::System::Simple> will default to throwing
+an exception if a non-zero exit value is returned.
 
-	run( [0..255], "cat *.txt");	# Any exit value is OK
+You may specify a range of values which are considered acceptable exit
+values by passing an I<array reference> as the first argument.  The
+special constant C<EXIT_ANY> can be used to allow I<any> exit value
+to be returned.
+
+	use IPC::System::Simple qw(run capture EXIT_ANY);
+
+	run( [0..5], "cat *.txt");             # Exit values 0-5 are OK
+
+	my @lines = capture( EXIT_ANY, "cat *.txt"); # Any exit is fine.
 
 The C<run> subroutine returns the exit value of the process:
 
@@ -257,20 +540,43 @@ The C<run> subroutine returns the exit value of the process:
 
 	print "Program exited with value $exit_value\n";
 
-=head2 $EXITVAL
+=head3 $EXITVAL
 
-After a call to C<run> the exit value of the command is always
-available in C<$IPC::System::Simple::EXITVAL>.  This will be set to
-C<-1> if the command did not exit normally (eg, being terminated by a
-signal) or did not start.
+The exit value of a command executed with either C<run> or
+C<capture> can always be retrieved from the 
+C<$IPC::System::Simple::EXITVAL> variable:
+
+	use IPC::System::Simple qw(capture $EXITVAL);
+
+	my @lines = capture("cat", "/etc/passwd");
+
+	print "Program exited with value $EXITVAL\n";
+
+This is particularly useful when inspecting results from C<capture>,
+which returns the captured text from the command.
+
+C<$EXITVAL> will be set to C<-1> if the command did not exit normally (eg,
+being terminated by a signal) or did not start.
 
 =head2 WINDOWS-SPECIFIC NOTES
 
 As of C<IPC::System::Simple> v0.06, the C<run> subroutine I<when
 called with multiple arguments> will make available the full 16-bit
-return value on Win32 systems.  This is different from the
+exit value on Win32 systems.  This is different from the
 previous versions of C<IPC::System::Simple> and from Perl's
 in-build C<system()> function, which can only handle 8-bit return values.
+
+The C<capture> subroutine always returns the 16-bit exit value under
+Windows.  The C<capture> subroutine also never uses the shell,
+even when passed a single argument.
+
+Versions of C<IPC::System::Simple> before v0.09 would not search
+the C<PATH> environment variable when the multi-argument form of
+C<run()> was called.  Versions from v0.09 onwards correctly search
+the path provided the command is provided including the extension
+(eg, C<notepad.exe> rather than just C<notepad>, or C<gvim.bat> rather
+than just C<gvim>).  If no extension is provided, C<.exe> is
+assumed.
 
 Signals are not supported on Windows systems.  Sending a signal
 to a Windows process will usually cause it to exit with the signal
@@ -279,31 +585,6 @@ number used.
 =head1 DIAGNOSTICS
 
 =over 4
-
-=item IPC::System::Simple::run called with no arguments
-
-You attempted to call C<run> but did not provide any arguments at all.
-
-=item IPC::System::Simple::run called with no command
-
-You called C<run> with a list of acceptable exit values, but no
-actual command.
-
-=item IPC::System::Simple::run called with tainted argument '%s'
-
-You called C<run> with tainted (untrusted) arguments, which is almost
-certainly a bad idea.  To untaint your arguments you'll need to
-pass your data through a regular expression and use the resulting
-match variables.  See L<perlsec/Laundering and Detecting Tainted Data>
-for more information.
-
-=item IPC::System::Simple::run called with tainted environment $ENV{%s}
-
-You called C<run> but part of your environment was tainted
-(untrusted).  You should either delete the named environment
-varaible before calling C<run>, or set it to an untainted value
-(usually one set inside your program).  See
-L<perlsec/Cleaning Up Your Path> for more information.
 
 =item "%s" failed to start: "%s"
 
@@ -316,18 +597,57 @@ start (as determined from C<$!>) will be provided.
 The command ran successfully, but returned an exit value we did
 not expect.  The value returned is reported.
 
-=item "%s" died to signal "%s" (%d)
+=item "%s" died to signal "%s" (%d) %s
 
 The command was killed by a signal.  The name of the signal
 will be reported, or C<UNKNOWN> if it cannot be determined.  The
-signal number is always reported.
+signal number is always reported.  If we detected that the
+process dumped core, then the string C<and dumped core> is
+appeneded.
 
-=item Internal error in IPC::System::Simple - "%s" ran without exit value or signal
+=item IPC::System::Simple::%s called with no arguments
 
-You've found a bug in C<IPC::System::Simple>.  It knows your command
-ran successfully, but doesn't know how or why it stopped.  Please
-report this error using the submission mechanism described in
-BUGS below.
+You attempted to call C<run> or C<capture> but did not provide any
+arguments at all.  At the very lease you need to supply a command
+to run.
+
+=item IPC::System::Simple::%s called with no command
+
+You called C<run> or C<capture> with a list of acceptable exit values,
+but no actual command.
+
+=item IPC::System::Simple::run called with tainted argument "%s"
+
+You called C<run> with tainted (untrusted) arguments, which is almost
+certainly a bad idea.  To untaint your arguments you'll need to
+pass your data through a regular expression and use the resulting
+match variables.  See L<perlsec/Laundering and Detecting Tainted Data>
+for more information.
+
+=item IPC::System::Simple::run called with tainted environment $ENV{%s}
+
+You called C<run> but part of your environment was tainted
+(untrusted).  You should either delete the named environment
+variable before calling C<run>, or set it to an untainted value
+(usually one set inside your program).  See
+L<perlsec/Cleaning Up Your Path> for more information.
+
+=item Error in IPC::System::Simple plumbing: "%s" - "%s"
+
+Implementing the C<capture()> command under Windows involves
+dark and terrible magicks involving pipes, and one of them
+has sprung a leak.  This could be due to a lack of file
+descriptors, although there are other possibilities.
+
+If you are able to reproduce this error, you are encouraged
+to submit a bug report according to the L</Reporting bugs> section below.
+
+=item Internal error in IPC::System::Simple: "%s"
+
+You've found a bug in C<IPC::System::Simple>.  Please check to
+see if an updated version of C<IPC::System::Simple> is available.
+If not, please file a bug report according to the L</Reporting bugs> section
+below.
 
 =back
 
@@ -341,9 +661,11 @@ There are no non-core dependencies on non-Win32 systems.
 
 =head1 BUGS
 
-Reporting of core-dumps is not yet implemented.
+Core dumps are only checked for when a process dies due to a
+signal.
 
-WIFSTOPPED status is not checked.
+C<WIFSTOPPED> status is not checked, as perl never spawns processes
+with the C<WUNTRACED> option.
 
 Signals are not supported under Win32 systems.
 
@@ -352,11 +674,24 @@ arguments under Windows, but only 8-bit values are returned when
 C<run()> is called with a single value.  We should always return 16-bit
 value on systems that support them.
 
-Please report bugs to L<http://rt.cpan.org/Public/Dist/Display.html?Name=IPC-System-Simple> .
+=head2 Reporting bugs
+
+Before reporting a bug, please check to ensure you are using the
+most recent version of C<IPC::System::Simple>.  Your problem may
+have already been fixed in a new release.
+
+You can find the C<IPC::System::Simple> bug-tracker at
+L<http://rt.cpan.org/Public/Dist/Display.html?Name=IPC-System-Simple> .
+Please check to see if your bug has already been reported; if
+in doubt, report yours anyway.
+
+Submitting a patch and/or failing test case will greatly expediate
+the fixing of bugs.
 
 =head1 SEE ALSO
 
-L<POSIX> L<IPC::Run::Simple> L<perlipc> L<perlport> L<IPC::Run> L<Win32::Process>
+L<POSIX>, L<IPC::Run::Simple>, L<perlipc>, L<perlport>, L<IPC::Run>,
+L<Win32::Process>
 
 =head1 AUTHOR
 
@@ -364,10 +699,10 @@ Paul Fenwick E<lt>pjf@cpan.orgE<gt>
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (C) 2006-2007 by Paul Fenwick
+Copyright (C) 2006-2008 by Paul Fenwick
 
 This library is free software; you can redistribute it and/or modify
-it under the same terms as Perl itself, either Perl version 5.8.7 or,
+it under the same terms as Perl itself, either Perl version 5.6.0 or,
 at your option, any later version of Perl 5 you may have available.
 
 =cut
