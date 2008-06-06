@@ -7,7 +7,7 @@ use ExtUtils::MakeMaker ();
 
 use vars qw{$VERSION $ISCORE @ISA};
 BEGIN {
-	$VERSION = '0.72';
+	$VERSION = '0.75';
 	$ISCORE  = 1;
 	@ISA     = qw{Module::Install::Base};
 }
@@ -119,7 +119,8 @@ sub write {
 
 	# MakeMaker can complain about module versions that include
 	# an underscore, even though its own version may contain one!
-	# Hence the funny regexp to get rid of it.
+	# Hence the funny regexp to get rid of it.  See RT #35800
+	# for details.
 
 	$self->configure_requires( 'ExtUtils::MakeMaker' => $ExtUtils::MakeMaker::VERSION =~ /^(\d+\.\d+)/ );
 
@@ -247,4 +248,4 @@ sub postamble {
 
 __END__
 
-#line 371
+#line 377

@@ -1,5 +1,5 @@
 ---
-abstract: 'Call system() commands with a minimum of fuss'
+abstract: 'Run commands simply, with detailed diagnostics'
 author:
   - 'Paul Fenwick <pjf@cpan.org>'
 build_requires:
@@ -7,7 +7,7 @@ build_requires:
   Test: 0
   Test::More: 0
 distribution_type: module
-generated_by: 'Module::Install version 0.720'
+generated_by: 'Module::Install version 0.75'
 license: perl
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.3.html
@@ -17,9 +17,10 @@ no_index:
   directory:
     - inc
     - t
+    - examples
 requires:
   Config: 0
   List::Util: 0
   Scalar::Util: 0
   perl: 5.6.0
-version: 0.09
+version: 0.11

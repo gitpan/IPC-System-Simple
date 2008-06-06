@@ -43,8 +43,8 @@ use constant UNDEFINED_POSIX_RE => qr{not (?:defined|a valid) POSIX macro};
 
 require Exporter;
 our @ISA = qw(Exporter);
-our @EXPORT_OK = qw( capture run $EXITVAL EXIT_ANY );
-our $VERSION = '0.10';
+our @EXPORT_OK = qw( capture run $EXITVAL EXIT_ANY system );
+our $VERSION = '0.11';
 our $EXITVAL = -1;
 
 my @Signal_from_number = split(' ', $Config{sig_name});
@@ -89,6 +89,10 @@ if ($@ =~ UNDEFINED_POSIX_RE) {
 	*WCOREDUMP = \&POSIX::WCOREDUMP;
 }
 
+# system simply calls run
+
+*system = \&run;
+
 # run is our way of running a process with system() semantics
 
 sub run {
@@ -119,7 +123,7 @@ sub run {
 	# We're throwing our own exception on command not found, so
 	# we don't need a warning from Perl.
 	no warnings 'exec';		## no critic
-	system($command,@args);
+	CORE::system($command,@args);
 
 	return _process_child_error($?,$command,$valid_returns);
 }
@@ -460,13 +464,70 @@ IPC::System::Simple - Run commands simply, with detailed diagnostics
 
 =head1 SYNOPSIS
 
-  use IPC::System::Simple qw(capture run $EXITVAL EXIT_ANY);
+  use IPC::System::Simple qw(system capture);
+
+  system("some_command");       # Command succeeds or dies!
+
+  system("some_command",@args); # Succeeds or dies, avoiding the shell.
+
+  # Capture the output of a command (just like backticks). Die on error.
+  my $output = capture("some_command");
+
+  # Just like backticks in list context.  Dies on error.
+  my @output = capture("some_command");
+
+  # Just like backticks, but avoid the shell!  Dies on error.
+  my $output = capture("some_command", @args);
+
+=head1 DESCRIPTION
+
+Calling Perl's in-built C<system()> function is easy, but it's
+altogether too easy to ignore the return value.  Let's face it,
+C<$?> isn't the nicest variable in the world to play with, and
+even if you I<do> check it, producing a well-formatted error
+string takes a lot of work.
+
+C<IPC::System::Simple> takes the hard work out of calling commands.
+In fact, if you want to be really lazy, you can just write:
+
+    use IPC::System::Simple qw(system);
+
+and all of your C<system> commands will either succeeed (run to
+completion and return a zero exit value), or die with rich diagnostic
+messages.  You can customise which exit values are acceptable if
+you like.
+
+The C<IPC::System::Simple> module also provides a similar replace
+to Perl's backticks operator.  Simply write:
+
+    use IPC::System::Simple qw(capture);
+
+and then use the L</capture()> command just like you'd use backticks.
+If there's an error, it will die with a detailed description of what
+went wrong.  Better still, you can even use L</capture()> to run the
+equivalent of backticks, but without the shell:
+
+    my $result = capture($command, @args);
+
+If you want more power than the basic interface, including the
+ability to specify which exit values are acceptable, trap errors,
+or process diagnostics, then read on!
+
+=head1 ADVANCED SYNOPSIS
+
+  use IPC::System::Simple qw(capture system run $EXITVAL EXIT_ANY);
 
   # Run a command, throwing exception on failure
 
   run("some_command");
 
   run("some_command",@args);  # Run a command, avoiding the shell
+
+  # Do the same thing, but with the drop-in system replacement.
+
+  system("some_command");
+
+  system("some_command, @args);
 
   # Run a command which must return 0..5, avoid the shell, and get the
   # exit value (we could also look at $EXITVAL)
@@ -493,14 +554,9 @@ IPC::System::Simple - Run commands simply, with detailed diagnostics
 
   my @lines  = capture([0..5], "some_command", @args);
 
-=head1 DESCRIPTION
+=head1 ADVNACED USAGE
 
-Calling Perl's in-built C<system()> function is easy, but checking
-the results can be hard.  C<IPC::System::Simple> aims to make
-life easy for the I<common cases> of calling C<system> and
-backticks (aka C<qx()>).
-
-=head2 run
+=head2 run() and system()
 
 C<IPC::System::Simple> provides a subroutine called
 C<run>, that executes a command using the same semantics is
@@ -511,7 +567,20 @@ Perl's built-in C<system>:
 	run("cat *.txt");	# Execute command via the shell
 	run("cat","/etc/motd");	# Execute command without shell
 
-=head2 capture
+The primary difference between Perl's in-built system and
+the C<run> command is that C<run> will throw an exception on
+failure, and allows a list of acceptable exit values to be set.
+See L</Exit values> for further information.
+
+In fact, you can even have C<IPC::System::Simple> replace the
+default C<system> function for your package so it has the
+same behaviour:
+
+    use IPC::System::Simple qw(simple);
+
+    system("cat *.txt");  # system now suceeds or dies!
+
+=head2 capture()
 
 A second subroutine, named C<capture> executes a command with
 the same semantics as Perl's built-in backticks (and C<qx()>):
@@ -583,15 +652,22 @@ values by passing an I<array reference> as the first argument.  The
 special constant C<EXIT_ANY> can be used to allow I<any> exit value
 to be returned.
 
-	use IPC::System::Simple qw(run capture EXIT_ANY);
+	use IPC::System::Simple qw(run system capture EXIT_ANY);
 
 	run( [0..5], "cat *.txt");             # Exit values 0-5 are OK
 
+	system( [0..5], "cat *.txt");          # This works the same way
+
 	my @lines = capture( EXIT_ANY, "cat *.txt"); # Any exit is fine.
 
-The C<run> subroutine returns the exit value of the process:
+The C<run> and replacement C<system> subroutines returns the exit
+value of the process:
 
 	my $exit_value = run( [0..5], "cat *.txt");
+
+	# OR:
+
+	my $exit_value = system( [0..5] "cat *.txt");
 
 	print "Program exited with value $exit_value\n";
 
@@ -712,18 +788,71 @@ and above.
 
 There are no non-core dependencies on non-Win32 systems.
 
+=head1 COMPARISON TO OTHER APIs
+
+Perl provides a range of in-built functions for handling external
+commands, and CPAN provides even more.  The C<IPC::System::Simple>
+differentiates itself from other options by providing:
+
+=over 4
+
+=item Extremely detailed diagnostics
+
+The diagnostics produced by C<IPC::System::Simple> are designed
+to provide as much information as possible.  Rather than requiring
+the developer to inspect C<$?>, C<IPC::System::Simple> does the
+hard work for you.
+
+If an odd exit status is provided, you're informed of what it is.  If
+a signal kills your process, you are informed of both its name and
+number.  If tainted data or environment prevents your command from
+running, you are informed of exactly which datais 
+
+=item Exceptions on failure
+
+C<IPC::System::Simple> takes an agressive approach to error handling.
+Rather than allow commands to fail silently, exceptions are thrown
+when unexpected results are seen.  This allows for easy development
+using a try/catch style, and avoids the possibility of accidently
+continuing after a failed command.
+
+=item Easy access to exit status
+
+The C<run>, C<system> and C<capture> commands all set C<$EXITVAL>,
+making it easy to determine the exit status of a command.
+Additionally, the C<system> and C<run> interfaces return the exit
+status.
+
+=item Consistent interfaces
+
+When called with multiple arguments, the C<run>, C<system> and
+C<capture> interfaces I<never> invoke the shell.  This differs
+from the in-built Perl C<system> command which may invoke the
+shell under Windows when called with multiple arguments.  It
+differs from the in-built Perl backticks operator which always
+invokes the shell.
+
+=back
+
 =head1 BUGS
 
+When C<system> is exported, the exotic form C<system { $cmd } @args>
+is not supported.  Attemping to use the exotic form is a syntax
+error.  This affects the calling package I<only>.
+
 Core dumps are only checked for when a process dies due to a
-signal.
+signal.  It is not believed thare exist any systems where processes
+can dump core without dying to a signal.
 
 C<WIFSTOPPED> status is not checked, as perl never spawns processes
 with the C<WUNTRACED> option.
 
-Signals are not supported under Win32 systems.
+Signals are not supported under Win32 systems, since they don't
+work at all like Unix signals.  Win32 singals cause commands to
+exit with a given exit value, which this modules I<does> capture.
 
 16-bit exit values are provided when C<run()> is called with multiple
-arguments under Windows, but only 8-bit values are returned when
+arguments under Windows.  Only 8-bit values are returned when
 C<run()> is called with a single value.  We should always return 16-bit
 value on systems that support them.
 
