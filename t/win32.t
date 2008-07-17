@@ -5,14 +5,25 @@ use File::Basename qw(fileparse);
 use IPC::System::Simple qw(run capture $EXITVAL);
 use Config;
 
+BEGIN {
+    if ($^O ne "MSWin32") {
+	    plan skip_all => "Win32 only tests";
+    }
+}
+
+# This number needs to fit into an 8 bit integer
+use constant SMALL_EXIT => 42;
+
 # This number needs to fit into a 16 bit integer, but not an 8 bit integer.
 use constant BIG_EXIT => 1000;
 
-if ($^O ne "MSWin32") {
-	plan skip_all => "Win32 only tests";
-}
+# This needs to fit into a 32-bit integer, but not a 16-bit integer.
+use constant HUGE_EXIT => 100_000;
 
-plan tests => 18;
+# This command should allow us to exit with a specific value.
+use constant EXIT_CMD => [ @{ &IPC::System::Simple::WINDOWS_SHELL }, 'exit'];
+
+plan tests => 28;
 
 my $perl_path = $Config{perlpath};
 $perl_path .= $Config{_exe} unless $perl_path =~ m/$Config{_exe}$/i;
@@ -25,12 +36,37 @@ ok($raw_perl, "Have perl executables with and w/o extensions.");
 
 chdir("t");
 
-my $exit = run([1000], $perl_path, "exiter.pl", BIG_EXIT);
+# Check for 16 and 32 bit returns.
 
-is($exit,BIG_EXIT,"16 bit exit value");
+foreach my $big_exitval (SMALL_EXIT, BIG_EXIT, HUGE_EXIT) {
 
-my $capture = capture([1000], $perl_path, "exiter.pl", BIG_EXIT);
-is($EXITVAL,BIG_EXIT,"Capture uses 16 bit exit value");
+    my $exit;
+    eval {
+        $exit = run([$big_exitval], @{&EXIT_CMD}, $big_exitval);
+    };
+
+    is($@,"","Running with $big_exitval ok");
+    is($exit,$big_exitval,"$big_exitval exit value");
+
+    my $capture;
+    
+    eval {
+	$capture = capture([$big_exitval], @{&EXIT_CMD}, $big_exitval);
+    };
+
+    is($@,"","Capturing with $big_exitval ok");
+    is($EXITVAL,$big_exitval,"Capture ok with $big_exitval exit value");
+}
+
+# As of June 2008, all versions of Perl under Win32 have a bug where
+# they can execute a command twice if it returns -1 and $! is set
+# to ENOENT or ENOEXEC before system is called.  
+
+# TODO: Test to see if we're running on a Perl that stuffers from
+# this bug.
+
+# TODO: Make sure that we *don't* suffer from this bug.
+
 
 # Testing to ensure that our PATH gets respected...
 
@@ -53,7 +89,7 @@ ok(1,"run found perl in path");
 run($raw_perl,"-e1");
 ok(1,"run found raw perl in path");
 
-$capture = capture($perl_exe,"-v");
+my $capture = capture($perl_exe,"-v");
 ok(1,"capture found perl in path");
 like($capture, qr/Larry Wall/, "Capture text successful");
 

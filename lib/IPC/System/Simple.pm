@@ -12,6 +12,17 @@ use constant WINDOWS => ($^O eq 'MSWin32');
 use constant VMS     => ($^O eq 'VMS');
 use if WINDOWS, 'Win32::Process', qw(INFINITE NORMAL_PRIORITY_CLASS);
 use if WINDOWS, 'File::Spec';
+use if WINDOWS, 'Win32';
+
+# This uses the same rules as the core win32.c/get_shell() call.
+
+use if WINDOWS, 'constant', WINDOWS_SHELL => eval { Win32::IsWinNT() }
+	                                  ? [ qw(cmd.exe /x/d/c) ]
+                                          : [ qw(command.com /c) ];
+
+# These are used when invoking _win32_capture
+use if WINDOWS, 'constant', NO_SHELL  => 0;
+use if WINDOWS, 'constant', USE_SHELL => 1;
 
 # Note that we don't use WIFSTOPPED because perl never uses
 # the WUNTRACED flag, and hence will never return early from
@@ -28,7 +39,6 @@ use constant FAIL_TAINT_ENV => q{%s called with tainted environment $ENV{%s}};
 use constant FAIL_SIGNAL    => q{"%s" died to signal "%s" (%d)%s};
 use constant FAIL_BADEXIT   => q{"%s" unexpectedly returned exit value %d};
 
-
 use constant FAIL_POSIX     => q{IPC::System::Simple does not understand the POSIX error '%s'.  Please check http://search.cpan.org/perldoc?IPC::System::Simple to see if there is an updated version.  If not please report this as a bug to http://rt.cpan.org/Public/Bug/Report.html?Queue=IPC-System-Simple};
 
 # On Perl's older than 5.8.x we can't assume that there'll be a
@@ -43,8 +53,8 @@ use constant UNDEFINED_POSIX_RE => qr{not (?:defined|a valid) POSIX macro};
 
 require Exporter;
 our @ISA = qw(Exporter);
-our @EXPORT_OK = qw( capture run $EXITVAL EXIT_ANY system );
-our $VERSION = '0.12';
+our @EXPORT_OK = qw( capture run $EXITVAL EXIT_ANY system systemx capturex );
+our $VERSION = '0.13';
 our $EXITVAL = -1;
 
 my @Signal_from_number = split(' ', $Config{sig_name});
@@ -75,7 +85,7 @@ if ($@ =~ UNDEFINED_POSIX_RE) {
 }
 
 # None of the POSIX modules I've found define WCOREDUMP, although
-# many systems define it.  Check the POSIX module on the hope that
+# many systems define it.  Check the POSIX module in the hope that
 # it may actually be there.
 
 eval { POSIX::WCOREDUMP(1); };
@@ -91,7 +101,8 @@ if ($@ =~ UNDEFINED_POSIX_RE) {
 
 # system simply calls run
 
-*system = \&run;
+*system  = \&run;
+*systemx = \&runx;
 
 # run is our way of running a process with system() semantics
 
@@ -101,31 +112,50 @@ sub run {
 
 	my ($valid_returns, $command, @args) = _process_args(@_);
 
-	# With the wonders of constant folding the following code
-	# is completely optimised away under non-windows systems.
+        # If we have arguments, we really want to call systemx,
+        # so we do so.
 
-	# The following essentially emulates multi-argument system,
-	# bypassing the shell entirely.
-
-	if (WINDOWS and @args) {
-		our $EXITVAL = -1;
-
-		my $pid = _spawn_or_die($command, "$command @args");
-
-		$pid->Wait(INFINITE);	# Wait for process exit.
-		$pid->GetExitCode($EXITVAL);
-		return _check_exit($command,$EXITVAL,$valid_returns);
+	if (@args) {
+                return systemx($valid_returns, $command, @args);
 	}
 
-	# On non-Win32 systems, or when we don't have multiple argument,
-	# we have an easier time.
+        # Without arguments, we're calling system, and checking
+        # the results.
 
 	# We're throwing our own exception on command not found, so
 	# we don't need a warning from Perl.
+
 	no warnings 'exec';		## no critic
 	CORE::system($command,@args);
 
 	return _process_child_error($?,$command,$valid_returns);
+}
+
+# runx is just like system/run, but *never* invokes the shell.
+
+sub runx {
+    _check_taint(@_);
+
+    my ($valid_returns, $command, @args) = _process_args(@_);
+
+    if (WINDOWS) {
+        our $EXITVAL = -1;
+
+        my $pid = _spawn_or_die($command, "$command @args");
+
+        $pid->Wait(INFINITE);	# Wait for process exit.
+        $pid->GetExitCode($EXITVAL);
+        return _check_exit($command,$EXITVAL,$valid_returns);
+    }
+
+    # If system() fails, we throw our own exception.  We don't
+    # need to have perl complain about it too.
+
+    no warnings; ## no critic
+
+    CORE::system { $command } $command, @args;
+
+    return _process_child_error($?, $command, $valid_returns);
 }
 
 # capture is our way of running a process with backticks/qx semantics
@@ -135,100 +165,144 @@ sub capture {
 
 	my ($valid_returns, $command, @args) = _process_args(@_);
 
+        if (@args) {
+            return capturex($valid_returns, $command, @args);
+        }
+
+        if (WINDOWS) {
+            # USE_SHELL really means "You may use the shell if you need it."
+            return _win32_capture(USE_SHELL, $valid_returns, $command, @args);
+        }
+
+	our $EXITVAL = -1;
+
+	my $wantarray = wantarray();
+
+	# We'll produce our own warnings on failure to execute.
+	no warnings 'exec';	## no critic
+
+        if ($wantarray) {
+                my @results = qx($command);
+                _process_child_error($?,$command,$valid_returns);
+                return @results;
+        } 
+
+        my $results = qx($command);
+        _process_child_error($?,$command,$valid_returns);
+        return $results;
+}
+
+# _win32_capture implements the capture and capurex commands on Win32.
+# We need to wrap the whole internals of this sub into
+# an if (WINDOWS) block to avoid it being compiled on non-Win32 systems.
+
+sub _win32_capture {
+    if (not WINDOWS) {
+        croak sprintf(FAIL_INTERNAL, "_win32_capture called when not under Win32");
+    } else {
+
+        my ($use_shell, $valid_returns, $command, @args) = @_;
+
+        my $wantarray = wantarray();
+
+        # Perl doesn't support multi-arg open under
+        # Windows.  Perl also doesn't provide very good
+        # feedback when normal backtails fail, either;
+        # it returns exit status from the shell
+        # (which is indistinguishable from the command
+        # running and producing the same exit status).
+
+        # As such, we essentially have to write our own
+        # backticks.
+
+        # We start by dup'ing STDOUT.
+
+        open(my $saved_stdout, '>&', \*STDOUT)  ## no critic
+                or croak sprintf(FAIL_PLUMBING, "Can't dup STDOUT", $!);
+
+        # We now open up a pipe that will allow us to	
+        # communicate with the new process.
+
+        pipe(my ($read_fh, $write_fh))
+                or croak sprintf(FAIL_PLUMBING, "Can't create pipe", $!);
+
+        # Allow CRLF sequences to become "\n", since
+        # this is what Perl backticks do.
+
+        binmode($read_fh, ':crlf');
+
+        # Now we re-open our STDOUT to $write_fh...
+
+        open(STDOUT, '>&', $write_fh)  ## no critic
+                or croak sprintf(FAIL_PLUMBING, "Can't redirect STDOUT", $!);
+
+        # If we have args, or we're told not to use the shell, then
+        # we treat $command as our shell.  Otherwise we grub around
+        # in our command to look for a command to run.
+        #
+        # Note that we don't actually *use* the shell (although in
+        # a future version we might).  Being told not to use the shell
+        # (capturex) means we treat our command as really being a command,
+        # and not a command line.
+
+        my $exe =   @args                      ? $command :
+                    (! $use_shell)             ? $command :
+                    $command =~ m{^"([^"]+)"}x ? $1       :
+                    $command =~ m{(\S+)     }x ? $1       :
+                    croak sprintf(FAIL_CMD_BLANK, $command);
+
+        # And now we spawn our new process with inherited
+        # filehandles.
+
+        my $pid = _spawn_or_die($exe, "$command @args");
+
+        # Now restore our STDOUT.
+        open(STDOUT, '>&', $saved_stdout)  ## no critic
+                or croak sprintf(FAIL_PLUMBING,"Can't restore STDOUT", $!);
+
+        # Clean-up the filehandles we no longer need...
+
+        close($write_fh)
+                or croak sprintf(FAIL_PLUMBING,q{Can't close write end of pipe}, $!);
+        close($saved_stdout)
+                or croak sprintf(FAIL_PLUMBING,q{Can't close saved STDOUT}, $!);
+
+        # Read the data from our child...
+
+        my (@results, $result);
+
+        if ($wantarray) {
+                @results = <$read_fh>;
+        } else {
+                $result = join("",<$read_fh>);
+        }
+
+        # Tidy up our windows process and we're done!
+
+        $pid->Wait(INFINITE);	# Wait for process exit.
+        $pid->GetExitCode($EXITVAL);
+
+        _check_exit($command,$EXITVAL,$valid_returns);
+
+        return $wantarray ? @results : $result;
+
+    }
+}
+
+# capturex() is just like backticks/qx, but never invokes the shell.
+
+sub capturex {
+	_check_taint(@_);
+
+	my ($valid_returns, $command, @args) = _process_args(@_);
+
 	our $EXITVAL = -1;
 
 	my $wantarray = wantarray();
 
 	if (WINDOWS) {
-		# Perl doesn't support multi-arg backticks under
-		# Windows.  Perl also doesn't provide very good
-		# feedback when normal backtails fail, either,
-		# instead returning the exit status from the shell
-		# (which is indistinguishable from the command
-		# running and producing the same exit status).
-
-		# As such, we essentially have to write our own
-		# backticks.
-
-		# We start by dup'ing STDOUT.
-
-		open(my $saved_stdout, '>&', \*STDOUT)  ## no critic
-			or croak sprintf(FAIL_PLUMBING, "Can't dup STDOUT", $!);
-
-		# We now open up a pipe that will allow us to	
-		# communicate with the new process.
-
-		pipe(my ($read_fh, $write_fh))
-			or croak sprintf(FAIL_PLUMBING, "Can't create pipe", $!);
-
-		# Allow CRLF sequences to become "\n", since
-		# this is what Perl backticks do.
-
-		binmode($read_fh, ':crlf');
-
-		# Now we re-open our STDOUT to $write_fh...
-
-		open(STDOUT, '>&', $write_fh)  ## no critic
-			or croak sprintf(FAIL_PLUMBING, "Can't redirect STDOUT", $!);
-
-		# And now we spawn our new process with inherited
-		# filehandles.
-
-		my $exe = @args                      ? $command :
-			  $command =~ m{^"([^"]+)"}x ? $1       :
-			  $command =~ m{(\S+)     }x ? $1       :
-			  croak sprintf(FAIL_CMD_BLANK, $command);
-
-		my $pid = _spawn_or_die($exe, "$command @args");
-
-		# Now restore our STDOUT.
-		open(STDOUT, '>&', $saved_stdout)  ## no critic
-			or croak sprintf(FAIL_PLUMBING,"Can't restore STDOUT", $!);
-
-		# Clean-up the filehandles we no longer need...
-
-		close($write_fh)
-			or croak sprintf(FAIL_PLUMBING,q{Can't close write end of pipe}, $!);
-		close($saved_stdout)
-			or croak sprintf(FAIL_PLUMBING,q{Can't close saved STDOUT}, $!);
-
-		# Read the data from our child...
-
-		my (@results, $result);
-
-		if ($wantarray) {
-			@results = <$read_fh>;
-		} else {
-			$result = join("",<$read_fh>);
-		}
-
-		# Tidy up our windows process and we're done!
-
-		$pid->Wait(INFINITE);	# Wait for process exit.
-		$pid->GetExitCode($EXITVAL);
-
-		_check_exit($command,$EXITVAL,$valid_returns);
-
-		return $wantarray ? @results : $result;
-	}
-
-	# We'll produce our own warnings on failure to execute.
-	no warnings 'exec';	## no critic
-
-	if (not @args) {
-		if ($wantarray) {
-			my @results = qx($command);
-			_process_child_error($?,$command,$valid_returns);
-			return @results;
-		} 
-
-		my $results = qx($command);
-		_process_child_error($?,$command,$valid_returns);
-		return $results;
-	}
-
-	# If we're here, we have arguments.  Avoid the shell using
-	# multi-arg open.
+            return _win32_capture(NO_SHELL, $valid_returns, $command, @args);
+        }
 
 	# We can't use a multi-arg piped open here, since 5.6.x
 	# doesn't like them.  Instead we emulate what 5.8.x does,
@@ -256,7 +330,7 @@ sub capture {
 
 		no warnings;   ## no critic
 
-		exec($command, @args);
+		CORE::exec { $command } $command, @args;
 
 		# Oh no, exec fails!  Send the reason why to
 		# the parent.
@@ -314,7 +388,7 @@ sub _spawn_or_die {
 
 	# We need to wrap practically the entire sub in an
 	# if block to ensure it doesn't get compiled under non-Win32
-	# systems.  Compiling on this systems would not only be a
+	# systems.  Compiling on these systems would not only be a
 	# waste of time, but also results in complaints about
 	# the NORMAL_PRIORITY_CLASS constant.
 
@@ -464,50 +538,59 @@ IPC::System::Simple - Run commands simply, with detailed diagnostics
 
 =head1 SYNOPSIS
 
-  use IPC::System::Simple qw(system capture);
+  use IPC::System::Simple qw(system systemx capture capturex);
 
   system("some_command");       # Command succeeds or dies!
 
-  system("some_command",@args); # Succeeds or dies, avoiding the shell.
+  system("some_command",@args); # Succeeds or dies, avoids shell if @args
 
-  # Capture the output of a command (just like backticks). Die on error.
+  systemx("some_command,@args); # Succeeds or dies, NEVER uses the shell
+
+
+  # Capture the output of a command (just like backticks). Dies on error.
   my $output = capture("some_command");
 
   # Just like backticks in list context.  Dies on error.
   my @output = capture("some_command");
 
-  # Just like backticks, but avoid the shell!  Dies on error.
+  # As above, but avoids the shell if @args is non-empty
   my $output = capture("some_command", @args);
+
+  # As above, but NEVER invokes the shell.
+  my $output = capturex("some_command", @args);
+  my @output = capturex("some_command", @args);
 
 =head1 DESCRIPTION
 
-Calling Perl's in-built C<system()> function is easy, but it's
-altogether too easy to ignore the return value.  Let's face it,
+Calling Perl's in-built C<system()> function is easy, 
+determining if it was successful is I<hard>.  Let's face it,
 C<$?> isn't the nicest variable in the world to play with, and
 even if you I<do> check it, producing a well-formatted error
 string takes a lot of work.
 
-C<IPC::System::Simple> takes the hard work out of calling commands.
-In fact, if you want to be really lazy, you can just write:
+C<IPC::System::Simple> takes the hard work out of calling 
+external commands.  In fact, if you want to be really lazy,
+you can just write:
 
     use IPC::System::Simple qw(system);
 
 and all of your C<system> commands will either succeeed (run to
 completion and return a zero exit value), or die with rich diagnostic
-messages.  You can customise which exit values are acceptable if
-you like.
+messages.
 
-The C<IPC::System::Simple> module also provides a similar replace
+The C<IPC::System::Simple> module also provides a simple replacement
 to Perl's backticks operator.  Simply write:
 
     use IPC::System::Simple qw(capture);
 
 and then use the L</capture()> command just like you'd use backticks.
 If there's an error, it will die with a detailed description of what
-went wrong.  Better still, you can even use L</capture()> to run the
+went wrong.  Better still, you can even use C<capturex()> to run the
 equivalent of backticks, but without the shell:
 
-    my $result = capture($command, @args);
+    use IPC::System::Simple qw(capturex);
+
+    my $result = capturex($command, @args);
 
 If you want more power than the basic interface, including the
 ability to specify which exit values are acceptable, trap errors,
@@ -515,28 +598,30 @@ or process diagnostics, then read on!
 
 =head1 ADVANCED SYNOPSIS
 
-  use IPC::System::Simple qw(capture system run $EXITVAL EXIT_ANY);
+  use IPC::System::Simple qw(
+    capture capturex system systemx run runx $EXITVAL EXIT_ANY
+  );
 
   # Run a command, throwing exception on failure
 
   run("some_command");
 
-  run("some_command",@args);  # Run a command, avoiding the shell
+  runx("some_command",@args);  # Run a command, avoiding the shell
 
   # Do the same thing, but with the drop-in system replacement.
 
   system("some_command");
 
-  system("some_command, @args);
+  systemx("some_command, @args);
 
   # Run a command which must return 0..5, avoid the shell, and get the
   # exit value (we could also look at $EXITVAL)
 
-  my $exit_value = run([0..5], "some_command", @args);
+  my $exit_value = runx([0..5], "some_command", @args);
 
   # The same, but any exit value will do.
 
-  my $exit_value = run(EXIT_ANY, "some_command", @args);
+  my $exit_value = runx(EXIT_ANY, "some_command", @args);
 
   # Capture output into $result and throw exception on failure
 
@@ -552,7 +637,7 @@ or process diagnostics, then read on!
   # Run a command which must return 0..5, capture the output into
   # @lines, and avoid the shell.
 
-  my @lines  = capture([0..5], "some_command", @args);
+  my @lines  = capturex([0..5], "some_command", @args);
 
 =head1 ADVNACED USAGE
 
@@ -562,10 +647,10 @@ C<IPC::System::Simple> provides a subroutine called
 C<run>, that executes a command using the same semantics is
 Perl's built-in C<system>:
 
-	use IPC::System::Simple qw(run);
+    use IPC::System::Simple qw(run);
 
-	run("cat *.txt");	# Execute command via the shell
-	run("cat","/etc/motd");	# Execute command without shell
+    run("cat *.txt");           # Execute command via the shell
+    run("cat","/etc/motd");     # Execute command without shell
 
 The primary difference between Perl's in-built system and
 the C<run> command is that C<run> will throw an exception on
@@ -580,23 +665,44 @@ same behaviour:
 
     system("cat *.txt");  # system now suceeds or dies!
 
+See also L</runx(), systemx() and capturex()> for variants of
+C<system()> and C<run()> that never invoke the shell, even with
+a single argument.
+
 =head2 capture()
 
 A second subroutine, named C<capture> executes a command with
 the same semantics as Perl's built-in backticks (and C<qx()>):
 
-	use IPC::System::Simple qw(capture);
+    use IPC::System::Simple qw(capture);
 
-	# Capture text while invoking the shell.
-	my $file  = capture("cat /etc/motd");
-	my @lines = capture("cat /etc/passwd");
+    # Capture text while invoking the shell.
+    my $file  = capture("cat /etc/motd");
+    my @lines = capture("cat /etc/passwd");
 
 However unlike regular backticks, which always use the shell, C<capture>
 will bypass the shell when called with multiple arguments:
 
-	# Capture text while avoiding the shell.
-	my $file  = capture("cat", "/etc/motd");
-	my @lines = capture("cat", "/etc/passwd");
+    # Capture text while avoiding the shell.
+    my $file  = capture("cat", "/etc/motd");
+    my @lines = capture("cat", "/etc/passwd");
+
+See also L</runx(), systemx() and capturex()> for a variant of
+C<capture()> that never invokes the shell, even with a single
+argument.
+
+=head2 runx(), systemx() and capturex()
+
+The C<runx()>, C<systemx()> and C<capturex()> commands are identical
+to the multi-argument forms of C<run()>, C<system()> and C<capture()>
+respectively, but I<never> invoke the shell, even when called with a
+single argument.  These forms are particularly useful when a command's
+argument list I<might> be empty, for example:
+
+    systemx($cmd, @args);
+
+The use of C<systemx()> here guarantees that the shell will I<never>
+be invoked, even if C<@args> is empty.
 
 =head2 Exception handling
 
@@ -606,13 +712,13 @@ program with an error.
 
 Capturing the exception is easy:
 
-	eval {
-		run("cat *.txt");
-	};
+    eval {
+        run("cat *.txt");
+    };
 
-	if ($@) {
-		print "Something went wrong - $@\n";
-	}
+    if ($@) {
+        print "Something went wrong - $@\n";
+    }
 
 See the diagnostics section below for more details.
 
@@ -692,12 +798,12 @@ being terminated by a signal) or did not start.
 =head2 WINDOWS-SPECIFIC NOTES
 
 As of C<IPC::System::Simple> v0.06, the C<run> subroutine I<when
-called with multiple arguments> will make available the full 16-bit
+called with multiple arguments> will make available the full 32-bit
 exit value on Win32 systems.  This is different from the
 previous versions of C<IPC::System::Simple> and from Perl's
 in-build C<system()> function, which can only handle 8-bit return values.
 
-The C<capture> subroutine always returns the 16-bit exit value under
+The C<capture> subroutine always returns the 32-bit exit value under
 Windows.  The C<capture> subroutine also never uses the shell,
 even when passed a single argument.
 
@@ -838,7 +944,9 @@ invokes the shell.
 
 When C<system> is exported, the exotic form C<system { $cmd } @args>
 is not supported.  Attemping to use the exotic form is a syntax
-error.  This affects the calling package I<only>.
+error.  This affects the calling package I<only>.  Use C<CORE::system>
+if you need it, or consider using the L<autodie> module to replace
+C<system> with lexical scope.
 
 Core dumps are only checked for when a process dies due to a
 signal.  It is not believed thare exist any systems where processes
@@ -851,10 +959,10 @@ Signals are not supported under Win32 systems, since they don't
 work at all like Unix signals.  Win32 singals cause commands to
 exit with a given exit value, which this modules I<does> capture.
 
-16-bit exit values are provided when C<run()> is called with multiple
-arguments under Windows.  Only 8-bit values are returned when
-C<run()> is called with a single value.  We should always return 16-bit
-value on systems that support them.
+Only 8-bit values are returned when C<run()> or C<system()> 
+is called with a single value under Win32.  Multi-argument calls
+to C<run()> and C<system()>, as well as the C<runx()> and
+C<systemx()> always return the 32-bit Windows return values.
 
 =head2 Reporting bugs
 
@@ -871,6 +979,9 @@ Submitting a patch and/or failing test case will greatly expediate
 the fixing of bugs.
 
 =head1 SEE ALSO
+
+L<autodie> uses C<IPC::System::Simple> to provide succeed-or-die
+replacements to C<system> (and other built-ins) with lexical scope.
 
 L<POSIX>, L<IPC::Run::Simple>, L<perlipc>, L<perlport>, L<IPC::Run>,
 L<IPC::Run3>, L<Win32::Process>
