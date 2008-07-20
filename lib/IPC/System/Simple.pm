@@ -53,8 +53,15 @@ use constant UNDEFINED_POSIX_RE => qr{not (?:defined|a valid) POSIX macro|not im
 
 require Exporter;
 our @ISA = qw(Exporter);
-our @EXPORT_OK = qw( capture run $EXITVAL EXIT_ANY system systemx capturex );
-our $VERSION = '0.14';
+
+our @EXPORT_OK = qw( 
+    capture  capturex
+    run      runx
+    system   systemx
+    $EXITVAL EXIT_ANY
+);
+
+our $VERSION = '0.15';
 our $EXITVAL = -1;
 
 my @Signal_from_number = split(' ', $Config{sig_name});
