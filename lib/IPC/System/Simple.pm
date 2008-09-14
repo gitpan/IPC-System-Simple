@@ -61,7 +61,7 @@ our @EXPORT_OK = qw(
     $EXITVAL EXIT_ANY
 );
 
-our $VERSION = '0.15';
+our $VERSION = '0.16';
 our $EXITVAL = -1;
 
 my @Signal_from_number = split(' ', $Config{sig_name});
@@ -547,11 +547,11 @@ IPC::System::Simple - Run commands simply, with detailed diagnostics
 
   use IPC::System::Simple qw(system systemx capture capturex);
 
-  system("some_command");       # Command succeeds or dies!
+  system("some_command");        # Command succeeds or dies!
 
-  system("some_command",@args); # Succeeds or dies, avoids shell if @args
+  system("some_command",@args);  # Succeeds or dies, avoids shell if @args
 
-  systemx("some_command,@args); # Succeeds or dies, NEVER uses the shell
+  systemx("some_command",@args); # Succeeds or dies, NEVER uses the shell
 
 
   # Capture the output of a command (just like backticks). Dies on error.
@@ -619,7 +619,7 @@ or process diagnostics, then read on!
 
   system("some_command");
 
-  systemx("some_command, @args);
+  systemx("some_command", @args);
 
   # Run a command which must return 0..5, avoid the shell, and get the
   # exit value (we could also look at $EXITVAL)
@@ -668,9 +668,11 @@ In fact, you can even have C<IPC::System::Simple> replace the
 default C<system> function for your package so it has the
 same behaviour:
 
-    use IPC::System::Simple qw(simple);
+    use IPC::System::Simple qw(system);
 
     system("cat *.txt");  # system now suceeds or dies!
+
+C<system> and C<run> are aliases to each other.
 
 See also L</runx(), systemx() and capturex()> for variants of
 C<system()> and C<run()> that never invoke the shell, even with
@@ -786,21 +788,22 @@ value of the process:
 
 =head3 $EXITVAL
 
-The exit value of a command executed with either C<run> or
-C<capture> can always be retrieved from the 
-C<$IPC::System::Simple::EXITVAL> variable:
-
-	use IPC::System::Simple qw(capture $EXITVAL);
-
-	my @lines = capture("cat", "/etc/passwd");
-
-	print "Program exited with value $EXITVAL\n";
+The exit value of any command exeucted by C<IPC::System::Simple>
+can always be retrieved from the C<$IPC::System::Simple::EXITVAL>
+variable:
 
 This is particularly useful when inspecting results from C<capture>,
 which returns the captured text from the command.
 
+	use IPC::System::Simple qw(capture $EXITVAL EXIT_ANY);
+
+	my @enemies_defeated = capture(EXIT_ANY, "defeat_evil", "/dev/mordor");
+
+	print "Program exited with value $EXITVAL\n";
+
 C<$EXITVAL> will be set to C<-1> if the command did not exit normally (eg,
-being terminated by a signal) or did not start.
+being terminated by a signal) or did not start.  In this situation an
+exception will also be thrown.
 
 =head2 WINDOWS-SPECIFIC NOTES
 
@@ -984,6 +987,16 @@ in doubt, report yours anyway.
 
 Submitting a patch and/or failing test case will greatly expediate
 the fixing of bugs.
+
+=head1 FEEDBACK
+
+If you find this module useful, please consider rating it on the
+CPAN Ratings service at
+L<http://cpanratings.perl.org/rate/?distribution=IPC-System-Simple> .
+
+The module author loves to hear how C<IPC::System::Simple> has made
+your life better (or worse).  Feedback can be sent to
+E<lt>pjf@perltraining.com.auE<gt>.
 
 =head1 SEE ALSO
 
