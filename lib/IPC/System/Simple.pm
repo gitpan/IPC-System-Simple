@@ -10,19 +10,40 @@ use Scalar::Util qw(tainted);
 use Config;
 use constant WINDOWS => ($^O eq 'MSWin32');
 use constant VMS     => ($^O eq 'VMS');
-use if WINDOWS, 'Win32::Process', qw(INFINITE NORMAL_PRIORITY_CLASS);
-use if WINDOWS, 'File::Spec';
-use if WINDOWS, 'Win32';
 
-# This uses the same rules as the core win32.c/get_shell() call.
+BEGIN {
 
-use if WINDOWS, 'constant', WINDOWS_SHELL => eval { Win32::IsWinNT() }
-	                                  ? [ qw(cmd.exe /x/d/c) ]
-                                          : [ qw(command.com /c) ];
+    # It would be lovely to use the 'if' module here, but it didn't
+    # enter core until 5.6.2, and we want to keep 5.6.0 compatibility.
 
-# These are used when invoking _win32_capture
-use if WINDOWS, 'constant', NO_SHELL  => 0;
-use if WINDOWS, 'constant', USE_SHELL => 1;
+
+    if (WINDOWS) {
+
+        ## no critic (ProhibitStringyEval)
+
+        eval q{
+            use Win32::Process qw(INFINITE NORMAL_PRIORITY_CLASS);
+            use File::Spec;
+            use Win32;
+
+            # This uses the same rules as the core win32.c/get_shell() call.
+
+            use constant WINDOWS_SHELL => eval { Win32::IsWinNT() }
+                                            ? [ qw(cmd.exe /x/d/c) ]
+                                            : [ qw(command.com /c) ];
+
+            # These are used when invoking _win32_capture
+            use constant NO_SHELL  => 0;
+            use constant USE_SHELL => 1;
+
+        };
+
+        ## use critic
+
+        # Die nosily if any of the above broke.
+        die $@ if $@;
+    }
+}
 
 # Note that we don't use WIFSTOPPED because perl never uses
 # the WUNTRACED flag, and hence will never return early from
@@ -63,7 +84,7 @@ our @EXPORT_OK = qw(
     $EXITVAL EXIT_ANY
 );
 
-our $VERSION = '1.17';
+our $VERSION = '1.18';
 our $EXITVAL = -1;
 
 my @Signal_from_number = split(' ', $Config{sig_name});
@@ -673,7 +694,7 @@ or process diagnostics, then read on!
 
   my @lines  = capturex([0..5], "some_command", @args);
 
-=head1 ADVNACED USAGE
+=head1 ADVANCED USAGE
 
 =head2 run() and system()
 

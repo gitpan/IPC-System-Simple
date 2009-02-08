@@ -29,4 +29,4 @@ resources:
   bugtracker: http://rt.cpan.org/NoAuth/Bugs.html?Dist=IPC-System-Simple
   license: http://dev.perl.org/licenses/
   repository: http://github.com/pfenwick/ipc-system-simple/tree/master
-version: 1.17
+version: 1.18
