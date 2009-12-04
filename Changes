@@ -1,5 +1,15 @@
 Revision history for Perl extension IPC::System::Simple.
 
+1.19  Fri Dec  4 14:14:25 EST 2009
+
+        * TEST: Added tests to ensure correct behaviour when
+          calling commands in Windows which are contained in directories
+          that contain spaces. (These tests are currently skiped,
+          as they're testing for a known bug.)
+
+        * BUGFIX: Spurious warnings about redefining POSIX macros
+          no longer plague Windows systems.
+
 1.18  Sun Feb  8 19:09:15 AUSEDT 2009
 
         * BUGFIX: IPC::System::Simple should now compile cleanly

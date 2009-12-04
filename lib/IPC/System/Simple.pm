@@ -84,7 +84,7 @@ our @EXPORT_OK = qw(
     $EXITVAL EXIT_ANY
 );
 
-our $VERSION = '1.18';
+our $VERSION = '1.19';
 our $EXITVAL = -1;
 
 my @Signal_from_number = split(' ', $Config{sig_name});
@@ -106,6 +106,7 @@ if (VMS) {
 eval { WIFEXITED(0); };
 
 if ($@ =~ UNDEFINED_POSIX_RE) {
+        no warnings 'redefine';  ## no critic
 	*WIFEXITED   = sub { not $_[0] & 0xff };
 	*WEXITSTATUS = sub { $_[0] >> 8  };
 	*WIFSIGNALED = sub { $_[0] & 127 };
