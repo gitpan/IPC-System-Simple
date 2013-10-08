@@ -1,26 +1,79 @@
-#!/usr/bin/perl -w
+
 use strict;
+use warnings;
+
 use 5.006;
-use constant WINDOWS => ($^O eq 'MSWin32');
-use inc::Module::Install;
 
-name(		'IPC-System-Simple');
-all_from(	'lib/IPC/System/Simple.pm');
+use ExtUtils::MakeMaker 6.30;
 
-requires(	'Config'	=> 0);
-requires(	'List::Util'	=> 0);
-requires(	'Scalar::Util'	=> 0);
-requires(	'Win32::Process'=> 0) if WINDOWS;
-requires(	'File::Spec'	=> 0) if WINDOWS;
 
-test_requires(	'Test'		=> 0);
-test_requires(	'Test::More'	=> 0);
-test_requires(	'File::Basename'=> 0);
 
-resources(	repository	=> "http://github.com/pfenwick/ipc-system-simple/tree/master");
-resources(	bugtracker	=> "http://rt.cpan.org/NoAuth/Bugs.html?Dist=IPC-System-Simple");
-resources(	Forum		=> "http://www.cpanforum.com/dist/IPC-System-Simple");
-resources(	Blog		=> "http://pjf.id.au/blog/toc.html?tag=ipc-system-simple");
+my %WriteMakefileArgs = (
+  "ABSTRACT" => "Run commands simply, with detailed diagnostics",
+  "AUTHOR" => "Paul Fenwick <pjf\@cpan.org>",
+  "BUILD_REQUIRES" => {},
+  "CONFIGURE_REQUIRES" => {
+    "ExtUtils::MakeMaker" => "6.30"
+  },
+  "DISTNAME" => "IPC-System-Simple",
+  "EXE_FILES" => [],
+  "LICENSE" => "perl",
+  "NAME" => "IPC::System::Simple",
+  "PREREQ_PM" => {
+    "Carp" => 0,
+    "Config" => 0,
+    "Exporter" => 0,
+    "List::Util" => 0,
+    "POSIX" => 0,
+    "Scalar::Util" => 0,
+    "constant" => 0,
+    "re" => 0,
+    "strict" => 0,
+    "warnings" => 0
+  },
+  "TEST_REQUIRES" => {
+    "BSD::Resource" => 0,
+    "File::Basename" => 0,
+    "Test" => 0,
+    "Test::More" => 0
+  },
+  "VERSION" => "1.22",
+  "test" => {
+    "TESTS" => "t/*.t"
+  }
+);
 
-WriteAll();
+
+unless ( eval { ExtUtils::MakeMaker->VERSION(6.63_03) } ) {
+  my $tr = delete $WriteMakefileArgs{TEST_REQUIRES};
+  my $br = $WriteMakefileArgs{BUILD_REQUIRES};
+  for my $mod ( keys %$tr ) {
+    if ( exists $br->{$mod} ) {
+      $br->{$mod} = $tr->{$mod} if $tr->{$mod} > $br->{$mod};
+    }
+    else {
+      $br->{$mod} = $tr->{$mod};
+    }
+  }
+}
+
+unless ( eval { ExtUtils::MakeMaker->VERSION(6.56) } ) {
+  my $br = delete $WriteMakefileArgs{BUILD_REQUIRES};
+  my $pp = $WriteMakefileArgs{PREREQ_PM};
+  for my $mod ( keys %$br ) {
+    if ( exists $pp->{$mod} ) {
+      $pp->{$mod} = $br->{$mod} if $br->{$mod} > $pp->{$mod};
+    }
+    else {
+      $pp->{$mod} = $br->{$mod};
+    }
+  }
+}
+
+delete $WriteMakefileArgs{CONFIGURE_REQUIRES}
+  unless eval { ExtUtils::MakeMaker->VERSION(6.52) };
+
+WriteMakefile(%WriteMakefileArgs);
+
+
 
