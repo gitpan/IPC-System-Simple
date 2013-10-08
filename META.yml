@@ -31,4 +31,4 @@ requires:
 resources:
   bugtracker: https://github.com/pjf/ipc-system-simple/issues
   repository: git://github.com/pjf/ipc-system-simple
-version: 1.22
+version: 1.23
