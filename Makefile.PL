@@ -21,7 +21,6 @@ my %WriteMakefileArgs = (
   "NAME" => "IPC::System::Simple",
   "PREREQ_PM" => {
     "Carp" => 0,
-    "Config" => 0,
     "Exporter" => 0,
     "List::Util" => 0,
     "POSIX" => 0,
@@ -32,12 +31,11 @@ my %WriteMakefileArgs = (
     "warnings" => 0
   },
   "TEST_REQUIRES" => {
-    "BSD::Resource" => 0,
     "File::Basename" => 0,
     "Test" => 0,
     "Test::More" => 0
   },
-  "VERSION" => "1.23",
+  "VERSION" => "1.24",
   "test" => {
     "TESTS" => "t/*.t"
   }

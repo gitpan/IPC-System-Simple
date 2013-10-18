@@ -1,5 +1,12 @@
 Revision history for Perl extension IPC::System::Simple.
 
+1.24      2013-10-18 16:27:39 Australia/Melbourne
+
+        * BUILD: No longer mark BSD::Resource as required (GH #6).
+
+        * TEST: Skip core-dump tests on OS X. They're not as
+          straightforward as the test script would like. (GH #5).
+
 1.23      2013-10-08 14:50:50 Australia/Melbourne
 
         * BUGFIX: Silence "Statement unlikely to be reached" warning

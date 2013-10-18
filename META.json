@@ -4,7 +4,7 @@
       "Paul Fenwick <pjf@cpan.org>"
    ],
    "dynamic_config" : 0,
-   "generated_by" : "Dist::Zilla version 4.300034, CPAN::Meta::Converter version 2.120921",
+   "generated_by" : "Dist::Zilla version 4.300039, CPAN::Meta::Converter version 2.120921",
    "license" : [
       "perl_5"
    ],
@@ -29,7 +29,6 @@
       "runtime" : {
          "requires" : {
             "Carp" : "0",
-            "Config" : "0",
             "Exporter" : "0",
             "List::Util" : "0",
             "POSIX" : "0",
@@ -43,7 +42,6 @@
       },
       "test" : {
          "requires" : {
-            "BSD::Resource" : "0",
             "File::Basename" : "0",
             "Test" : "0",
             "Test::More" : "0"
@@ -61,6 +59,6 @@
          "web" : "https://github.com/pjf/ipc-system-simple"
       }
    },
-   "version" : "1.23"
+   "version" : "1.24"
 }
 
